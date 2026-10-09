@@ -1,0 +1,383 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VisionLog AI - Object Detection</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1120;color:#edf4ff;font-family:Arial,sans-serif}
+header{padding:20px;background:#121d30;border-bottom:1px solid #29374e}
+main{max-width:1000px;margin:auto;padding:18px}
+h1{font-size:23px;margin:0 0 8px}
+h2{font-size:17px}
+p{line-height:1.5;color:#aab8ce}
+.card{background:#141f32;border:1px solid #2b3a51;border-radius:15px;padding:16px;margin-bottom:16px}
+.status{padding:12px;border-radius:9px;background:#0a1825;color:#65edb9;font-size:13px;overflow-wrap:anywhere}
+.error{color:#ff9aa6;background:#321c2a}
+button,select,input{padding:12px;border:1px solid #34445c;border-radius:9px;background:#1c2b42;color:white;font-size:14px}
+button{cursor:pointer}
+button:disabled{opacity:.5}
+.primary{background:#31e6a1;color:#05251b;border:0;font-weight:bold}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.controls button{flex:1}
+.camera{position:relative;background:#05080e;border-radius:12px;overflow:hidden;min-height:220px;aspect-ratio:4/3}
+video,canvas{position:absolute;width:100%;height:100%;inset:0}
+video{object-fit:contain}
+video.mirror{transform:scaleX(-1)}
+canvas{pointer-events:none}
+#placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;color:#b7c5d9}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
+.stat{background:#101a2a;padding:13px;border-radius:10px;overflow-wrap:anywhere}
+.stat strong{display:block;font-size:25px;margin-top:8px}
+.small{font-size:12px;color:#9eafc7}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td,th{padding:10px 6px;border-bottom:1px solid #2b3a51;text-align:left}
+th{color:#9eafc7}
+.tablewrap{overflow-x:auto}
+#diagnostics{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.65}
+input{width:100%;margin:8px 0}
+</style>
+</head>
+<body>
+<header>
+<h1>◉ VisionLog AI</h1>
+<div class="small">Real-Time Object Detection & Logging Platform</div>
+<p id="topStatus">Starting diagnostics...</p>
+</header>
+
+<main>
+<div class="stats">
+<div class="stat">Detection Events<strong id="total">0</strong></div>
+<div class="stat">Object Types<strong id="unique">0</strong></div>
+<div class="stat">Current Objects<strong id="current">0</strong></div>
+</div>
+
+<section class="card">
+<h2>Live Detection Camera</h2>
+<div class="camera">
+<video id="video" autoplay muted playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="placeholder">📷<br><br>Camera is not running</div>
+</div>
+<div class="controls">
+<button class="primary" id="start">Start Detection</button>
+<button id="stop" disabled>Stop</button>
+<button id="flip" disabled>Flip Camera</button>
+</div>
+<div id="modelStatus" class="status">AI model: Not loaded</div>
+<p class="small">Allow camera permission. Keep internet on to download the AI model. Point the camera at a bottle, cup, person, or another supported object.</p>
+</section>
+
+<section class="card">
+<h2>Diagnostics</h2>
+<div id="diagnostics" class="status">Checking browser support...</div>
+<div class="controls">
+<button id="test">Test Camera Support</button>
+<button id="retry">Retry AI Model</button>
+</div>
+</section>
+
+<section class="card">
+<h2>Detection Settings</h2>
+<label for="confidence">Minimum confidence</label>
+<select id="confidence" style="width:100%;margin-top:8px">
+<option value=".3">30% - More detections</option>
+<option value=".5" selected>50% - Balanced</option>
+<option value=".7">70% - High confidence</option>
+<option value=".85">85% - Very high confidence</option>
+</select>
+<h2>Current Frame Objects</h2>
+<div id="objects" class="status">No objects yet</div>
+</section>
+
+<section class="card">
+<h2>Detection Logs</h2>
+<input id="search" placeholder="Search object names">
+<div class="controls">
+<button id="csv">Export CSV</button>
+<button id="clear">Clear Logs</button>
+</div>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Time</th><th>Object</th><th>Confidence</th><th>ID</th></tr></thead>
+<tbody id="logs"><tr><td colspan="4">No detections recorded.</td></tr></tbody>
+</table>
+</div>
+<p class="small">Logs are stored in memory until the page is refreshed. Export CSV to keep a copy.</p>
+</section>
+</main>
+
+<!-- Both libraries must load before object detection can work. -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"
+onerror="window.tfScriptFailed=true"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"
+onerror="window.cocoScriptFailed=true"></script>
+
+<script>
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const video=$("video"), canvas=$("canvas"), ctx=canvas.getContext("2d");
+
+let model=null,stream=null,running=false,loading=false,busy=false;
+let facing="environment",raf=0,seq=0,records=[];
+let lastLogged={},lastError="",seen=new Set();
+
+function diagnostic(message,isError=false){
+  const d=$("diagnostics");
+  d.className="status"+(isError?" error":"");
+  d.textContent=message;
+  console.log("[VisionLog]",message);
+}
+function status(message,isError=false){
+  $("topStatus").textContent=message;
+  if(isError) diagnostic(message,true);
+}
+function modelMessage(message,isError=false){
+  $("modelStatus").textContent=message;
+  $("modelStatus").className="status"+(isError?" error":"");
+}
+function browserCheck(){
+  const secure=window.isSecureContext;
+  const media=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
+  const tf=!!window.tf;
+  const coco=!!window.cocoSsd;
+  let message=
+    "Page URL: "+location.href+
+    "\nSecure context: "+secure+
+    "\nCamera API available: "+media+
+    "\nTensorFlow.js loaded: "+tf+
+    "\nCOCO-SSD library loaded: "+coco+
+    "\nBrowser: "+navigator.userAgent;
+
+  if(!secure||!media){
+    message+="\n\nACTION: Open the page on HTTPS or localhost in a browser that supports camera access. SPCK Preview may not expose the camera API.";
+  } else {
+    message+="\n\nCamera API is available. Press Start Detection to request camera permission.";
+  }
+  diagnostic(message,!secure||!media);
+}
+async function loadModel(){
+  if(model)return model;
+  if(loading)throw Error("Model loading is already in progress. Wait and retry.");
+  loading=true;
+  modelMessage("Loading AI libraries and COCO-SSD model. Please wait...");
+  try{
+    if(!navigator.onLine)throw Error("Internet is offline. Connect to the internet and retry.");
+    if(window.tfScriptFailed)throw Error("TensorFlow.js CDN script failed to load.");
+    if(window.cocoScriptFailed)throw Error("COCO-SSD CDN script failed to load.");
+    if(!window.tf)throw Error("TensorFlow.js is unavailable. The CDN may be blocked or still loading.");
+    if(!window.cocoSsd)throw Error("COCO-SSD library is unavailable. Check your connection.");
+    await tf.ready();
+    diagnostic("TensorFlow.js loaded.\nBackend: "+tf.getBackend()+"\nLoading COCO-SSD weights...");
+    model=await Promise.race([
+      cocoSsd.load({base:"lite_mobilenet_v2"}),
+      new Promise((_,reject)=>setTimeout(
+        ()=>reject(Error("AI model loading timed out. Check internet/CDN access and retry.")),60000))
+    ]);
+    modelMessage("AI model loaded. Ready for object detection.");
+    diagnostic("SUCCESS: AI model loaded.\nBackend: "+tf.getBackend());
+    return model;
+  }catch(e){
+    lastError=e.message||String(e);
+    modelMessage("MODEL ERROR: "+lastError,true);
+    diagnostic("AI MODEL ERROR\n"+lastError+
+      "\n\nCheck internet, CDN access, and browser console. Then tap Retry AI Model.",true);
+    throw e;
+  }finally{loading=false;}
+}
+async function cameraRequest(){
+  if(!window.isSecureContext){
+    throw Error("INSECURE CONTEXT: camera access requires HTTPS or localhost. SPCK Preview cannot be forced to grant access. Deploy to HTTPS and open that link in Chrome.");
+  }
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    throw Error("CAMERA API MISSING: this preview/browser does not expose getUserMedia. Open the website in Chrome using HTTPS.");
+  }
+  try{
+    return await navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{facingMode:{ideal:facing},width:{ideal:640},height:{ideal:480}}
+    });
+  }catch(e){
+    const messages={
+      NotAllowedError:"CAMERA PERMISSION DENIED or blocked by the preview. Allow camera access in browser/site settings and open the HTTPS website directly in Chrome.",
+      NotFoundError:"NO CAMERA FOUND. Check that your phone has a working camera.",
+      NotReadableError:"CAMERA BUSY. Close other apps using the camera and retry.",
+      OverconstrainedError:"CAMERA SETTINGS NOT SUPPORTED. Retrying with default camera settings may help.",
+      SecurityError:"SECURITY BLOCK: the preview/browser does not allow camera access.",
+      AbortError:"CAMERA START ABORTED. Retry the camera."
+    };
+    if(e.name==="OverconstrainedError"){
+      return await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+    }
+    throw Error((messages[e.name]||"Camera failed: "+e.name)+
+      "\nBrowser detail: "+(e.message||"No additional detail"));
+  }
+}
+async function start(){
+  if(running||loading)return;
+  $("start").disabled=true;
+  status("Starting detection...");
+  diagnostic("Step 1: Checking camera and browser...");
+  try{
+    // Camera first, so a broken camera environment is diagnosed immediately.
+    stream=await cameraRequest();
+    video.srcObject=stream;
+    video.classList.toggle("mirror",facing==="user");
+    await new Promise((resolve,reject)=>{
+      if(video.readyState>=1&&video.videoWidth)return resolve();
+      const timer=setTimeout(()=>reject(Error("Camera opened but video metadata timed out.")),12000);
+      video.onloadedmetadata=()=>{clearTimeout(timer);resolve();};
+      video.onerror=()=>{clearTimeout(timer);reject(Error("Video element failed to load camera stream."));};
+    });
+    await video.play();
+
+    diagnostic("Camera opened successfully.\nResolution: "+video.videoWidth+" × "+video.videoHeight+
+      "\nStep 2: Loading AI model...");
+    await loadModel();
+
+    canvas.width=video.videoWidth;
+    canvas.height=video.videoHeight;
+    running=true;
+    $("placeholder").style.display="none";
+    $("stop").disabled=false;
+    $("flip").disabled=false;
+    status("LIVE · camera and AI model ready");
+    diagnostic("SUCCESS: Camera and AI model are ready.\nDetection is running.");
+    raf=requestAnimationFrame(loop);
+  }catch(e){
+    lastError=e.message||String(e);
+    status("START FAILED: "+lastError,true);
+    modelMessage("ERROR: "+lastError,true);
+    if(stream)stream.getTracks().forEach(t=>t.stop());
+    stream=null;
+    video.srcObject=null;
+    $("placeholder").style.display="flex";
+    $("stop").disabled=true;
+    $("flip").disabled=true;
+    $("start").disabled=false;
+    console.error("[VisionLog startup]",e);
+  }
+}
+function stop(){
+  running=false;
+  cancelAnimationFrame(raf);
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=null;
+  video.pause();
+  video.srcObject=null;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  $("placeholder").style.display="flex";
+  $("start").disabled=false;
+  $("stop").disabled=true;
+  $("flip").disabled=true;
+  $("current").textContent="0";
+  $("objects").textContent="Camera stopped.";
+  status("Detection stopped");
+}
+async function flip(){
+  if(!running)return;
+  stop();
+  facing=facing==="environment"?"user":"environment";
+  await start();
+}
+async function loop(){
+  if(!running)return;
+  if(busy||video.readyState<2){
+    raf=requestAnimationFrame(loop);return;
+  }
+  busy=true;
+  try{
+    const preds=await model.detect(video,20,Number($("confidence").value));
+    if(!running)return;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    const counts={};
+    preds.forEach(p=>{
+      const [x,y,w,h]=p.bbox;
+      const label=p.class+" "+Math.round(p.score*100)+"%";
+      ctx.lineWidth=3;ctx.strokeStyle="#31e6a1";ctx.strokeRect(x,y,w,h);
+      ctx.font="bold 14px Arial";
+      const tw=ctx.measureText(label).width+12, top=Math.max(0,y-25);
+      ctx.fillStyle="#31e6a1";ctx.fillRect(x,top,tw,25);
+      ctx.fillStyle="#062219";ctx.fillText(label,x+6,top+17);
+      counts[p.class]=(counts[p.class]||0)+1;
+      const now=Date.now();
+      if(now-(lastLogged[p.class]||0)>2000){
+        lastLogged[p.class]=now;
+        records.unshift({id:++seq,time:new Date().toLocaleString(),
+          name:p.class,score:p.score});
+        if(records.length>5000)records.pop();
+        seen.add(p.class);
+      }
+    });
+    $("current").textContent=preds.length;
+    $("total").textContent=records.length;
+    $("unique").textContent=seen.size;
+    $("objects").textContent=Object.keys(counts).length?
+      Object.entries(counts).map(([n,c])=>n+" × "+c).join(" | "):
+      "No objects above "+Math.round(Number($("confidence").value)*100)+"% confidence.";
+    renderLogs();
+  }catch(e){
+    lastError=e.message||String(e);
+    diagnostic("DETECTION ERROR: "+lastError,true);
+    modelMessage("Detection error: "+lastError,true);
+    console.error(e);
+  }finally{
+    busy=false;
+    if(running)raf=requestAnimationFrame(loop);
+  }
+}
+function renderLogs(){
+  const query=$("search").value.trim().toLowerCase();
+  const filtered=records.filter(r=>r.name.toLowerCase().includes(query)).slice(0,200);
+  const body=$("logs");body.replaceChildren();
+  if(!filtered.length){
+    const tr=body.insertRow(),td=tr.insertCell();
+    td.colSpan=4;td.textContent="No matching detection events.";return;
+  }
+  filtered.forEach(r=>{
+    const tr=body.insertRow();
+    [r.time,r.name,(r.score*100).toFixed(1)+"%","#"+r.id].forEach(v=>{
+      const td=tr.insertCell();td.textContent=v;
+    });
+  });
+}
+$("start").addEventListener("click",start);
+$("stop").addEventListener("click",stop);
+$("flip").addEventListener("click",flip);
+$("test").addEventListener("click",browserCheck);
+$("retry").addEventListener("click",async()=>{
+  model=null;
+  try{await loadModel();}catch(e){}
+});
+$("confidence").addEventListener("change",()=>{
+  modelMessage("Confidence threshold: "+Math.round(Number($("confidence").value)*100)+"%");
+});
+$("search").addEventListener("input",renderLogs);
+$("csv").addEventListener("click",()=>{
+  if(!records.length){alert("No logs yet. Start detection first.");return;}
+  const esc=v=>'"'+String(v).replace(/"/g,'""')+'"';
+  const csv=[["ID","Timestamp","Object","Confidence"],
+    ...records.slice().reverse().map(r=>[r.id,r.time,r.name,(r.score*100).toFixed(2)+"%"])]
+    .map(row=>row.map(esc).join(",")).join("\r\n");
+  const url=URL.createObjectURL(new Blob(["\uFEFF"+csv],{type:"text/csv;charset=utf-8"}));
+  const a=document.createElement("a");a.href=url;a.download="visionlog.csv";a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
+$("clear").addEventListener("click",()=>{
+  if(!confirm("Clear all detection logs?"))return;
+  records=[];seen.clear();lastLogged={};seq=0;
+  $("total").textContent="0";$("unique").textContent="0";renderLogs();
+});
+window.addEventListener("pagehide",()=>{
+  running=false;
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+});
+browserCheck();
+if(!navigator.onLine)modelMessage("Internet is offline. Connect before loading the AI model.",true);
+})();
+</script>
+</body>
+</html>
